@@ -50,11 +50,7 @@ class ResourceManager:
             gpu_ranks = ray.get([
                 get_visible_gpus.options(
                     placement_group=pg,
-                    **(
-                        {"num_gpus": self.gpu_per_node}
-                        if current_platform.ray_device_key == "GPU"
-                        else {"resources": {current_platform.ray_device_key: self.gpu_per_node}}
-                    )
+                    num_gpus=1 if current_platform.ray_device_key == "GPU" else 0
                 ).remote(current_platform.device_control_env_var)
                 for pg in self.placement_groups
             ])

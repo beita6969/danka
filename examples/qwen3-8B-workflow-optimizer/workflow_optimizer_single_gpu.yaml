@@ -1,0 +1,251 @@
+# Qwen3-8B Workflow Optimizer - Single A100 80G Configuration
+#
+# Optimized for single GPU with 80GB VRAM
+# Uses LoRA + aggressive memory optimization to fit everything on one card
+
+# Global Settings
+exp_name: "qwen3-8B-workflow-optimizer-single-gpu"
+seed: 42
+max_steps: 50  # TESTING: 50 steps (change to 1000 for full training)
+save_steps: 100
+logging_steps: 5
+eval_steps: 50
+
+# Model Configuration
+pretrain: Qwen/Qwen2.5-7B-Instruct  # Qwen2.5-7B-Instruct with LoRA fits on single A100 80G
+
+# Sequence Lengths (balanced for single GPU)
+rollout_batch_size: 8   # Reduced for single GPU
+prompt_length: 3072     # Slightly reduced but still sufficient
+response_length: 3072   # Slightly reduced but still sufficient
+
+# LoRA Configuration (same as multi-GPU)
+lora_target: o_proj,q_proj,k_proj,v_proj
+lora_rank: 32
+lora_alpha: 32
+
+# GRPO Configuration
+num_return_sequences_in_group: 4  # Reduced from 8 to 4 for memory
+adv_estimator: "grpo"
+norm_mean_type: "group"
+norm_std_type: "group"
+
+# PPO Hyperparameters
+ppo_epochs: 1
+pg_variant: "ppo"
+pg_clip: 0.2
+dual_clip_loss: true
+
+# KL Divergence Control
+init_kl_coef: 0.2
+target_kl: 0.1
+add_token_level_kl: false
+
+# Reward and Advantage
+reward_clip: 20.0
+advantage_clip: 5.0
+whiten_advantages: true
+
+# Masking
+max_len_mask: true
+difficulty_mask: false
+error_max_len_clip: false
+
+# Loss Weighting
+difficulty_loss_weight: false
+length_loss_weight: false
+rl_loss_coef: 1.0
+
+# Actor Training Configuration (SINGLE GPU)
+actor_train:
+  name: "actor_train"
+  worker_cls: "roll.pipeline.rlvr.actor_pg_worker.ActorPGWorker"
+
+  model_args:
+    model_name_or_path: ${pretrain}
+    lora_target: ${lora_target}
+    lora_rank: ${lora_rank}
+    lora_alpha: ${lora_alpha}
+    disable_gradient_checkpointing: false  # Enable for memory saving
+    dtype: bf16
+    model_type: ~
+
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0.0
+    per_device_train_batch_size: 1  # Keep at 1
+    gradient_accumulation_steps: 32  # Increased to compensate
+    warmup_steps: 50
+    num_train_epochs: 3
+    max_grad_norm: 1.0
+    logging_steps: ${logging_steps}
+    save_steps: ${save_steps}
+
+  data_args:
+    template: qwen2_5  # Switch to qwen2_5 template like official ROLL examples
+    file_name:
+      - data/rl_training_data_full/train_data.jsonl  # 477 samples (expanded dataset)
+    domain_interleave_probs:
+      workflow_math: 0.4      # Math: GSM8K, MATH (40%)
+      workflow_code: 0.3      # Code: HumanEval, MBPP (30%)
+      workflow_qa: 0.3        # QA: HotpotQA, DROP (30%)
+    preprocessing_num_workers: ~  # CRITICAL: Must be None (null) to avoid chat_template serialization issues
+    cutoff_len: 6144  # Max sequence length (prompt + response)
+
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config:
+      zero_optimization:
+        stage: 2  # Stage 2 for single GPU (more efficient than Stage 3)
+        overlap_comm: true
+        contiguous_gradients: true
+        reduce_bucket_size: 5.0e8
+        allgather_bucket_size: 5.0e8
+        cpu_offload: false  # 80G should be sufficient
+      gradient_accumulation_steps: ${actor_train.training_args.gradient_accumulation_steps}
+      train_micro_batch_size_per_gpu: ${actor_train.training_args.per_device_train_batch_size}
+      gradient_clipping: ${actor_train.training_args.max_grad_norm}
+      bf16:
+        enabled: true
+      zero_allow_untested_optimizer: true
+
+  device_mapping: "list(range(0,1))"  # Single GPU
+  world_size: 1
+  infer_batch_size: 1
+  use_dynamic_batching_in_train: false
+
+# Actor Inference Configuration (SINGLE GPU)
+actor_infer:
+  name: "actor_infer"
+  worker_cls: "roll.pipeline.rlvr.actor_worker.ActorWorker"
+
+  model_args:
+    model_name_or_path: ${pretrain}
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+
+  generating_args:
+    max_new_tokens: 3072
+    top_p: 0.95
+    top_k: 50
+    num_beams: 1
+    temperature: 0.9
+    num_return_sequences: ${num_return_sequences_in_group}
+    do_sample: true
+
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.7  # Leave room for training
+      block_size: 16
+      max_model_len: 6144  # prompt + response
+      trust_remote_code: true
+      tensor_parallel_size: 1  # Single GPU
+
+  device_mapping: "list(range(0,1))"
+  world_size: 1
+
+# Reference Model Configuration (SINGLE GPU)
+# With LoRA, we use the base model as reference
+reference:
+  name: "reference"
+  worker_cls: "roll.pipeline.rlvr.actor_worker.ActorWorker"
+
+  model_args:
+    model_name_or_path: ${pretrain}
+    disable_gradient_checkpointing: true
+    dtype: bf16
+
+  strategy_args:
+    strategy_name: megatron_infer
+    strategy_config:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+
+  device_mapping: "list(range(0,1))"
+  world_size: 1
+  infer_batch_size: 2
+
+# Reward Configuration (CPU-based, no GPU needed)
+rewards:
+  workflow_optimization:
+    worker_cls: roll.pipeline.rlvr.rewards.workflow_reward_worker.WorkflowRewardWorker
+    name: "workflow_reward"
+    reward_type: "continuous"
+    tag_included:
+      - GSM8K
+      - MATH
+      - HumanEval
+      - MBPP
+      - HotpotQA
+      - DROP
+    world_size: 4  # CPU workers, parallel processing
+    infer_batch_size: 1
+
+    reward_config:
+      alpha: 10.0
+      beta: 1.0
+      gamma: 0.1
+      quick_eval_samples: 5  # Reduced for faster feedback
+      exec_llm_config:
+        model_name: "gpt-4o-mini"
+        api_key: ${oc.env:OPENAI_API_KEY}
+        temperature: 0.0
+
+    device_mapping: "[]"  # CPU-based
+
+    query_filter_config:
+      type: "no_filter"
+      filter_args: {}
+
+# Validation Configuration
+validation:
+  enabled: true
+
+  data_args:
+    template: qwen2_5  # Switch to qwen2_5 template like official ROLL examples
+    file_name:
+      - data/rl_training_data_full/val_data.jsonl  # 120 samples (expanded dataset)
+    preprocessing_num_workers: ~  # CRITICAL: Must be None (null) to avoid serialization issues
+
+  generating_args:
+    max_new_tokens: 3072
+    top_p: 0.95
+    top_k: 50
+    num_beams: 1
+    temperature: 0.9
+    num_return_sequences: 1
+
+# Checkpoint and Logging
+save_path: data/checkpoints/qwen3-8b-workflow-optimizer-single-gpu
+checkpoint_dir: ${save_path}/checkpoints
+logging_dir: ${save_path}/logs
+save_logging_board_dir: ${save_path}/tensorboard
+
+# Monitoring
+use_wandb: false
+wandb_project: "aflow-roll-integration"
+wandb_run_name: ${exp_name}
+
+# Resource Management
+async_pipeline: false  # Keep simple for single GPU
+
+# Debugging
+debug_mode: false
+
+# Memory Optimization Notes:
+# 1. gradient_checkpointing enabled to save memory
+# 2. ZeRO Stage 2 (optimal for single GPU)
+# 3. Reduced batch_size compensated by gradient_accumulation
+# 4. vLLM gpu_memory_utilization at 0.7 to leave room
+# 5. Smaller num_return_sequences (4 vs 8)
+# 6. LoRA keeps trainable params minimal (~100M vs 7B)
+#
+# Expected Memory Usage:
+# - Model (bf16): ~14GB
+# - LoRA adapters: ~0.5GB
+# - Optimizer states (ZeRO-2): ~7GB
+# - Activations: ~10-15GB (with checkpointing)
+# - KV cache (vLLM): ~20-30GB
+# Total: ~60-70GB (within 80GB limit)

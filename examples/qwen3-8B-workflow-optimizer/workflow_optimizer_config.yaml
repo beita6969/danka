@@ -1,0 +1,228 @@
+# Qwen3-8B Workflow Optimizer Configuration
+#
+# This configuration trains qwen3-8b with LoRA to optimize agent workflows.
+# The model learns to generate improved workflows based on current performance.
+
+# Global Settings
+exp_name: "qwen3-8B-workflow-optimizer"
+seed: 42
+max_steps: 1000
+save_steps: 100
+logging_steps: 5
+eval_steps: 50
+
+# Model Configuration
+pretrain: Qwen/Qwen2.5-7B  # Using 7B for now, will upgrade to 8B when available
+
+# Sequence Lengths (longer for workflow code)
+rollout_batch_size: 16  # Reduced due to longer sequences
+prompt_length: 4096     # Long enough for full workflow + context
+response_length: 4096   # Long enough for complete workflow generation
+
+# LoRA Configuration
+lora_target: o_proj,q_proj,k_proj,v_proj
+lora_rank: 32
+lora_alpha: 32
+
+# GRPO Configuration (Group Relative Policy Optimization)
+num_return_sequences_in_group: 8  # Generate 8 workflow candidates per state
+adv_estimator: "grpo"              # Use GRPO for stable training
+norm_mean_type: "group"            # Group-relative advantage normalization
+norm_std_type: "group"             # Group-relative std normalization
+
+# PPO Hyperparameters
+ppo_epochs: 1
+pg_variant: "ppo"  # Can also try: grpo, topr, cispo
+pg_clip: 0.2
+dual_clip_loss: true
+
+# KL Divergence Control
+init_kl_coef: 0.2
+target_kl: 0.1
+add_token_level_kl: false
+
+# Reward and Advantage
+reward_clip: 20.0      # Clip extreme rewards
+advantage_clip: 5.0    # Clip advantages for stability
+whiten_advantages: true
+
+# Masking (workflow-specific)
+max_len_mask: true                    # Filter responses hitting max length
+difficulty_mask: false                # Don't filter by difficulty for now
+error_max_len_clip: false
+
+# Loss Weighting
+difficulty_loss_weight: false
+length_loss_weight: false
+rl_loss_coef: 1.0
+
+# Actor Training Configuration
+actor_train:
+  name: "actor_train"
+  worker_cls: "roll.pipeline.rlvr.actor_pg_worker.ActorPGWorker"
+
+  model_args:
+    model_name_or_path: ${pretrain}
+    lora_target: ${lora_target}
+    lora_rank: ${lora_rank}
+    lora_alpha: ${lora_alpha}
+    disable_gradient_checkpointing: true  # Required for LoRA training
+    dtype: bf16
+    model_type: ~
+
+  training_args:
+    learning_rate: 1.0e-6  # Conservative LR for RL
+    weight_decay: 0.0
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 16  # Effective batch = 1 * 16 = 16
+    warmup_steps: 50
+    num_train_epochs: 3
+    max_grad_norm: 1.0
+    logging_steps: ${logging_steps}
+    save_steps: ${save_steps}
+
+  data_args:
+    template: qwen2  # Use qwen2 chat template
+    file_name:
+      - data/rl_training_data/train_data.jsonl  # Training data
+    domain_interleave_probs:
+      workflow_optimization: 1.0  # 100% workflow optimization tasks
+    preprocessing_num_workers: 8
+
+  strategy_args:
+    strategy_name: deepspeed_train  # LoRA requires DeepSpeed
+    strategy_config:
+      zero_optimization:
+        stage: 3  # ZeRO-3: Partition optimizer states, gradients, parameters
+        overlap_comm: true
+        contiguous_gradients: true
+        reduce_bucket_size: 5.0e8
+        stage3_prefetch_bucket_size: 5.0e8
+        stage3_param_persistence_threshold: 1.0e6
+        stage3_max_live_parameters: 1.0e9
+        stage3_max_reuse_distance: 1.0e9
+        cpu_offload: false  # Set true if memory constrained
+      gradient_accumulation_steps: ${actor_train.training_args.gradient_accumulation_steps}
+      train_micro_batch_size_per_gpu: ${actor_train.training_args.per_device_train_batch_size}
+      gradient_clipping: ${actor_train.training_args.max_grad_norm}
+      bf16:
+        enabled: true
+      zero_allow_untested_optimizer: true
+
+  device_mapping: [0,1,2,3,4,5,6,7]  # Use 8 GPUs for training
+  infer_batch_size: 2
+  use_dynamic_batching_in_train: false  # Disable for simplicity initially
+
+# Actor Inference Configuration
+actor_infer:
+  name: "actor_infer"
+  worker_cls: "roll.pipeline.rlvr.actor_worker.ActorWorker"
+
+  model_args:
+    model_name_or_path: ${pretrain}
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+
+  generating_args:
+    max_new_tokens: 4096
+    top_p: 0.95
+    top_k: 50
+    num_beams: 1
+    temperature: 0.9  # Moderate temperature for exploration
+    num_return_sequences: ${num_return_sequences_in_group}
+    do_sample: true
+
+  strategy_args:
+    strategy_name: vllm  # Use vLLM for fast inference
+    strategy_config:
+      gpu_memory_utilization: 0.85
+      block_size: 16
+      max_model_len: 8192  # prompt + response
+      trust_remote_code: true
+
+  device_mapping: [0,1,2,3]  # Use 4 GPUs for inference
+  world_size: 4
+
+# Reference Model Configuration
+# Note: With LoRA, we don't need a separate reference model
+# The unwrapped base model serves as reference
+reference:
+  name: "reference"
+  worker_cls: "roll.pipeline.rlvr.actor_worker.ActorWorker"
+
+  model_args:
+    model_name_or_path: ${pretrain}
+    disable_gradient_checkpointing: true
+    dtype: bf16
+
+  strategy_args:
+    strategy_name: megatron_infer
+    strategy_config:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+
+  device_mapping: [4,5,6,7]
+  infer_batch_size: 4
+
+# Multi-Domain Reward Configuration
+rewards:
+  workflow_optimization:
+    worker_cls: roll.pipeline.rlvr.rewards.workflow_reward_worker.WorkflowRewardWorker
+    name: "workflow_reward"
+    reward_type: "continuous"  # Continuous reward (not binary)
+    tag_included:  # All workflow optimization tasks
+      - GSM8K
+      - MATH
+      - HumanEval
+      - MBPP
+      - HotpotQA
+      - DROP
+    world_size: 8  # Use 8 workers for parallel reward computation
+    infer_batch_size: 1
+
+    # Workflow reward specific config
+    reward_config:
+      alpha: 10.0    # Performance gain weight
+      beta: 1.0      # Validity bonus weight
+      gamma: 0.1     # Cost penalty weight
+      quick_eval_samples: 10  # Fast evaluation (10 samples)
+      exec_llm_config:
+        model_name: "gpt-4o-mini"
+        api_key: ${oc.env:OPENAI_API_KEY}
+        temperature: 0.0
+
+    device_mapping: []  # CPU-based reward computation
+
+    # Query filtering (optional)
+    query_filter_config:
+      type: "no_filter"
+      filter_args: {}
+
+# Validation Configuration
+validation:
+  enabled: true
+
+  data_args:
+    template: qwen2
+    file_name:
+      - data/rl_training_data/val_data.jsonl
+    preprocessing_num_workers: 4
+
+# Checkpoint and Logging
+save_path: data/checkpoints/qwen3-8b-workflow-optimizer
+checkpoint_dir: ${save_path}/checkpoints
+logging_dir: ${save_path}/logs
+save_logging_board_dir: ${save_path}/tensorboard
+
+# Monitoring
+use_wandb: false  # Set true to enable W&B logging
+wandb_project: "aflow-roll-integration"
+wandb_run_name: ${exp_name}
+
+# Resource Management
+async_pipeline: false  # Set true for async generation (advanced)
+async_generation_ratio: 1.0
+
+# Debugging
+debug_mode: false

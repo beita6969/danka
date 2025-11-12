@@ -515,7 +515,9 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         peft_model = self.unwrap_model()
         if not self.ds_config.is_zero3():
             lora_state_dict = get_peft_model_state_dict(peft_model)
-            return lora_state_dict
+            # Directly use tensor values from state_dict
+            lora_params = [(name, param) for name, param in lora_state_dict.items()]
+            return lora_params
 
         adapter_name = "default"
         state_dict = peft_model.state_dict()

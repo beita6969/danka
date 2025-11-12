@@ -74,18 +74,67 @@ def preprocess_dataset(dataset, prompt_len, encode_function, data_args):
 
 def get_encode_function(template_name, data_args, tokenizer):
     chat_template_func = get_chat_template(template_name, tokenizer)
+    # Get max_length from data_args or use default
+    max_length = getattr(data_args, 'cutoff_len', None) or getattr(data_args, 'max_length', 8192)
 
     def encode_function(data_i):
+        # Handle batched input (data_i is a dict with lists as values)
         text_list = []
+
         if (message_key := getattr(data_args, "messages", "messages")) in data_i:
-            for messages in data_i[message_key]:
-                if isinstance(messages, str):
-                    messages = json.loads(messages)
-                text_list.append(chat_template_func(messages))
+            # data_i[message_key] is a list of JSON strings (one per sample in batch)
+            for messages_str in data_i[message_key]:
+                # Parse JSON string if needed
+                if isinstance(messages_str, str):
+                    try:
+                        messages_value = json.loads(messages_str)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse messages JSON: {messages_str[:100] if messages_str else 'empty'}...")
+                        messages_value = None
+                else:
+                    messages_value = messages_str
+
+                # Apply chat template to the parsed messages
+                if messages_value:
+                    try:
+                        text = chat_template_func(messages_value)
+                        text_list.append(text)
+                    except Exception as e:
+                        logger.error(f"chat_template_func ERROR for sample: {e}")
+                        logger.error(f"messages_value type: {type(messages_value)}, len: {len(messages_value) if isinstance(messages_value, list) else 'N/A'}")
+                        text_list.append("")
+                else:
+                    # Add empty string for failed samples to maintain batch alignment
+                    text_list.append("")
+
         elif (prompt_key := getattr(data_args, "prompt", "prompt")) in data_i:
-            for prompt in data_i[prompt_key]:
-                text_list.append(prompt)
-        encodings = tokenizer(text_list)
+            # Handle prompt field (could be list of prompts or list of lists)
+            for prompt_value in data_i[prompt_key]:
+                if isinstance(prompt_value, list):
+                    # If it's a list of prompts, join them or take first
+                    if prompt_value:
+                        text_list.append(prompt_value[0] if prompt_value[0] else "")
+                    else:
+                        text_list.append("")
+                elif prompt_value:
+                    text_list.append(prompt_value)
+                else:
+                    text_list.append("")
+
+        # Tokenize all texts in batch
+        if len(text_list) == 0:
+            logger.warning("Empty text_list encountered in encode_function for entire batch")
+            # Return empty encodings matching batch structure
+            return {"input_ids": [], "attention_mask": []}
+
+        # Add truncation to handle long sequences
+        encodings = tokenizer(
+            text_list,
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+            return_tensors=None  # Return list instead of tensor
+        )
         return encodings
 
     return encode_function
