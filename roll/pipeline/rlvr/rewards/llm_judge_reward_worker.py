@@ -225,7 +225,7 @@ class LLMJudgeRewardWorker(Worker):
 
         scores = []
         for prompt_id, prompt_txt, response, reference in zip(
-            data.non_tensor_batch["id"], prompts_text_list, response_text_list, data.non_tensor_batch["ground_truth"]
+            data.non_tensor_batch["tag"], prompts_text_list, response_text_list, data.non_tensor_batch["ground_truth"]
         ):
             score, info = self._get_llm_judgment(prompt_id, prompt_txt, response, reference)
             scores.append(score)

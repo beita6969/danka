@@ -823,7 +823,7 @@ class CodeSandboxRewardWorker(Worker):
         response_text_list = self.tokenizer.batch_decode(data.batch["responses"], skip_special_tokens=True)
         for i, (prompt_id, prompt_txt, response, case_type, test_cases, test_case_function, tag) in enumerate(
             zip(
-                data.non_tensor_batch["id"],
+                data.non_tensor_batch["tag"],
                 prompts_text_list,
                 response_text_list,
                 data.non_tensor_batch["case_type"],
